@@ -1,0 +1,14 @@
+#generated on Thu Oct 17 11:54:37 2013 using mklcbolinput.pro
+#
+#NAME     sn2002bo
+#AV_HOST  0.000 +/- 0.000
+#RV_HOST  3.100 +/- 0.000
+#AV_MW    0.000 +/- 0.000
+#RV_MW    3.100 +/- 0.000
+#DIST_MOD 31.900 +/- 0.000
+#NFILT    2 (B_Bessell,V_Bessell)
+#
+#FILTER B_Bessell - 1 MEASUREMENTS (MJD MAG MAGERR)
+52356.8700    14.050     0.050
+#FILTER V_Bessell - 1 MEASUREMENTS (MJD MAG MAGERR)
+52356.8700    13.680     0.020

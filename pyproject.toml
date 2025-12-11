@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pseudobolo"
+version = "0.1.0"
+description = "Tools to build pseudo-bolometric light curves for supernovae."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+
+authors = [
+  { name = "Cristine Koelln" }
+]
+
+dependencies = [
+  "numpy>=1.23",
+  "pandas>=1.5",
+  "matplotlib>=3.8",
+  "scikit-learn>=1.5",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest",
+  "pytest-cov",
+]
+
+docs = [
+  "sphinx",
+  "sphinx-rtd-theme",
+  "myst-parser",
+]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["pseudobolo*"]
+
+[tool.setuptools_scm]
+# Picks version like 0.2.1 from your latest git tag "v0.2.1" or "0.2.1".
+version_scheme = "guess-next-dev"
+local_scheme = "node-and-date"
+fallback_version = "0.0.0"
+
+# Optional: include any non-Python files under src/single_sne/** if you have templates/data
+# [tool.setuptools.package-data]
+# "pseudobolo" = ["tests/*"]
