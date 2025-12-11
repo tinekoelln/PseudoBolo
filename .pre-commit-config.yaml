@@ -1,0 +1,13 @@
+repos:
+  - repo: local
+    hooks:
+      - id: pip-compile-main
+        name: pip-compile main requirements
+        entry: bash -c 'pip-compile requirements.in && git add requirements.txt'
+        language: system
+        files: ^requirements\.in$
+      - id: pip-compile-docs
+        name: pip-compile docs requirements
+        entry: bash -c 'pip-compile docs/requirements.in && git add docs/requirements.txt'
+        language: system
+        files: ^docs/requirements\.in$
