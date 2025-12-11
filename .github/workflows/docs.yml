@@ -23,8 +23,8 @@ jobs:
       - name: Generate API stubs with sphinx-apidoc
         run: |
           python -m sphinx.ext.apidoc \
-          -o docs/api \
-          src/single_sne \
+          -o docs/api.rst \
+          src/pseudobolo \
           --force --module-first
 
       - name: Build Sphinx (module invocation)
