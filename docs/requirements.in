@@ -4,3 +4,11 @@ numpy
 pandas
 matplotlib
 scikit-learn
+astropy
+scipy
+beautifulsoup4
+sphinx
+sphinx-rtd-theme
+furo
+sphinx-autodoc-typehints
+pyqt5
