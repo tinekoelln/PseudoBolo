@@ -3,11 +3,15 @@ from __future__ import annotations
 import numpy as np
 from dataclasses import dataclass
 import pathlib
+
 from typing import List, Optional, Sequence, Tuple
 from scipy.interpolate import interp1d, UnivariateSpline
 from pseudobolo.aux import al_av, estimate_56ni, filter_shortname, create_lc_df
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Button
+import matplotlib
+matplotlib.use('Qt5Agg') 
+
 from matplotlib.widgets import Button
 import pandas as pd
 
@@ -310,7 +314,9 @@ class PseudoBoloWizard:
         self,
         lightcurve_file: str | pathlib.Path,
         pbinfo_file: str | pathlib.Path | None = None,
+        integration_method: str = "histogram",
         debug: bool = False,
+        save_steps: bool = False,
     ):
         """
         GUI wizard for building a pseudo-bolometric light curve.
@@ -322,10 +328,20 @@ class PseudoBoloWizard:
         pbinfo_file : str or Path or None
             Path to pbinfo.dat.
             If None, a default tests/tests_data/pbinfo.dat is used.
+        integration_method: "histogram" or "trapezoidal"
+            Determines how to integrate the fluxes
         debug : bool
             Extra prints, etc.
+        save_steps: bool
+            If turned on, it will also create .dat files containing the separate interpolations 
+            for each filter, as well as a file with the integrated flux
         """
         self.debug = debug
+        self.save_steps = save_steps
+        self.integration_method = integration_method
+        if (self.integration_method != "trapezoidal") and (self.integration_method != "histogram"):
+            raise ValueError("Invalid integration method: Must be either 'histogram' or 'trapezoidal'") 
+        
         self.infile = pathlib.Path(lightcurve_file)
         if pbinfo_file is None:
             here = pathlib.Path(__file__).resolve()
@@ -349,6 +365,7 @@ class PseudoBoloWizard:
         self.mjd_max = self.lightcurve_df["mjd"].max()
         self.time_grid = None  # will be set from _create_time_grid
         self.coverage_patches = {}
+        self.RESULTS_DIR = pathlib.Path(__file__).resolve().parents[2] / "tests" / "tests_results"
 
         # --- Build figure + first step ---
         self._build_figure()
@@ -543,6 +560,37 @@ class PseudoBoloWizard:
         t_grid = t_grid[t_grid <= t_max]
         return t_grid
     
+    def _save_filter_interp(self, filter_name):
+        """Store the GP interpolation results for a given filter."""
+        from datetime import datetime
+        from pytz import UTC
+        hdr = self.hdr
+        infile = self.infile
+        time_grid = self.time_grid
+        mag_interp = self.gp_interp[filter_name]["mag"]
+        magerr_interp = self.gp_interp[filter_name]["err"]
+        filters = self.selected_filters
+        shortname = filter_shortname(filter_name)
+        filt_list = ", ".join(filters)
+        nmeas = len(mag_interp)
+        interp_file = self.RESULTS_DIR / "filter_interp"/ f"{hdr.name}_{shortname}_interp_gp_py.dat"
+        with interp_file.open("w") as f:
+            f.write(f"#generated on {datetime.now(UTC).isoformat()} using single_sne bolometric LC wizard\n")
+            f.write(f"#INFILE    {infile.name}\n")
+            f.write(f"#NAME      {hdr.name}\n")
+            f.write(f"#AV_HOST   {hdr.avhost:6.3f} +/- {hdr.avhosterr:6.3f}\n")
+            f.write(f"#RV_HOST   {hdr.rvhost:6.3f} +/- {hdr.rvhosterr:6.3f}\n")
+            f.write(f"#AV_MW     {hdr.avmw:6.3f} +/- {hdr.avmwerr:6.3f}\n")
+            f.write(f"#RV_MW     {hdr.rvmw:6.3f} +/- {hdr.rvmwerr:6.3f}\n")
+            f.write(f"#DIST_MOD  {hdr.dmod:6.3f} +/- {hdr.dmoderr:6.3f}\n")
+            f.write(f"#NFILT     1 ({filter_name})\n")
+            f.write("#\n")
+            f.write("#time[mjd]    mag     mag_err\n")
+            f.write(f"#FILTER {filter_name} - {nmeas} interpolated measurements\n")
+            for tt, LL, LLerr in zip(time_grid, mag_interp, magerr_interp):
+                f.write(f"{tt:10.3f}  {LL:15.8E}  {LLerr:15.8E}\n")
+
+        print(f"Created file {interp_file}")
     
     
     def _on_next(self, event):
@@ -588,6 +636,8 @@ class PseudoBoloWizard:
 
         if self.step == 2:
             self.step = 1
+            self._clear_step_widgets()
+            self._clear_axes()
             print("Returning to step 1.")
             self.btn_next.label.set_text("Next")
             self._build_step1()
@@ -595,21 +645,25 @@ class PseudoBoloWizard:
         elif self.step == 3:
             self.step = 2
             print("Returning to step 2.")
+            self._clear_step_widgets()
+            self._clear_axes()
             self.btn_next.label.set_text("Next")  # or "Next" vs "Finish" logic later
             self._build_step2()
             
         elif self.step == 4:
             self.step = 3
+            self._clear_step_widgets()
+            self._clear_axes()
             print("Returning to step 3.")
             self.btn_next.label.set_text("Next")
             self._build_step3()
 
 
-    # ---------- STEP 1: filter selection ----------
     def _build_step1(self):
         # make sure any old step widgets are gone
         self._clear_step_widgets()
         self._clear_axes()
+        
         self.fig.suptitle("Step 1: Select filters\n"
                           "Click a panel to toggle selection (grey = OFF).\n"
                           "Press 'Next' when done.",
@@ -617,8 +671,8 @@ class PseudoBoloWizard:
 
     
         # --- Determine filters and layout ---
-        self.ncols = 3
         filters_unique = sorted(self.lightcurve_df["filter"].unique())
+        
         # Build (filter, lambda_eff) list
         f_lam = []
         for f in filters_unique:
@@ -627,46 +681,47 @@ class PseudoBoloWizard:
 
         # Sort by lambda_eff
         f_lam_sorted = sorted(f_lam, key=lambda t: t[1])
-
-        # Keep only the filter names in the new order
         filters = [f for (f, _) in f_lam_sorted]
         self.filters = filters
         n_filt = len(filters)
         
-        # Total rows: 1 (coverage) + nrows_filters (per-filter plots)
-        self.ncols = min(self.ncols, n_filt)
-        self.nrows_filters = int(np.ceil(n_filt / self.ncols))
-        
         if n_filt == 0:
             raise ValueError("No filters found in lightcurve_df['filter'].")
+
+        # --- 1. SQUARE GRID LOGIC ---
+        # Calculate roughly square grid
+        self.ncols = int(np.ceil(np.sqrt(n_filt)))
+        self.nrows_filters = int(np.ceil(n_filt / self.ncols))
         
         self.preset_groups = {
                 "UBVRI": ["U", "B", "V", "R", "I"],
                 "BVRI":  ["B", "V", "R", "I"],
-                "JHK":   ["J", "H", "K"],   # we’ll also match 'Ks'
-                "All":   ["*"],        # '*' = all filters
+                "JHK":   ["J", "H", "K"],   
+                "All":   ["*"],   
+                "None": ["ZWXJ"],     
             }
 
-
+        # --- UPDATED SPACING HERE ---
         self.gs = self.fig.add_gridspec(
             self.nrows_filters + 1,
             self.ncols,
             top=0.90,
-            bottom=0.21,          # <- keep clear of preset + nav buttons
+            bottom=0.21,          
             left=0.08,
             right=0.98,
-            height_ratios=[1.4] + [1.0] * self.nrows_filters,
-            hspace=0.70,          # <- extra space between coverage & panels
+            height_ratios=[1.5] + [1.0] * self.nrows_filters,
+            hspace=0.7,          # INCREASED: Vertical spacing between rows
+            wspace=0.25,          # INCREASED: Horizontal spacing between cols
         )
         
-
         # --- Top coverage axis spanning all columns ---
         self.coverage_ax = self.fig.add_subplot(self.gs[0, :])
-        self.coverage_ax.set_xlabel("Wavelength [$\\AA$]")
         self.coverage_ax.set_ylabel("Transmission")
         self.coverage_ax.grid(True, alpha = 0.1)
-        self.coverage_ax.set_title("Filter Transmission Blocks")
+        self.coverage_ax.set_title("Filter Transmission Blocks", fontsize=10)
         self.coverage_ax.set_ylim(0, 1.2)
+        # Only show wavelength label on top plot, push title up slightly
+        self.coverage_ax.set_xlabel("Wavelength [$\\AA$]", labelpad=5) 
 
         # Track selection state and artists
         self.selected = {f: True for f in filters}
@@ -674,50 +729,100 @@ class PseudoBoloWizard:
         self.axes_step1 = []
         self.ax_to_filter = {}        
 
-        # --- Plot transmission curves for each filter ---
-        for f in filters:
+        # --- 2. COLOR SETUP ---
+        import matplotlib.cm as cm
+        # 'turbo' or 'nipy_spectral' are good for spectral progression
+        cmap = cm.get_cmap('turbo') 
+        
+        # Store colors per filter
+        filter_colors = {}
+
+        # --- Plot transmission curves ---
+        for i, f in enumerate(filters):
             lam_eff, ew = self._get_pbinfo(f)
             short = filter_shortname(f)
             lam_min = lam_eff - (ew/2.0)
             lam_max = lam_eff + (ew/2.0)
             wave = np.linspace(lam_min, lam_max, 50)
-            poly = self.coverage_ax.fill_between(wave, 0, 1, alpha = 0.8)
-            self.coverage_ax.annotate(f"{short}", xy=(lam_eff, 1.05), xycoords="data", ha = "center", fontsize="small")
+            
+            # Pick color from map
+            color = cmap(i / max(n_filt - 1, 1))
+            filter_colors[f] = color
+            
+            # Plot with this color
+            poly = self.coverage_ax.fill_between(wave, 0, 1, color=color, alpha=0.6, edgecolor='none')
+            
+            # Label with UPDATED ZORDER
+            self.coverage_ax.annotate(f"{short}", xy=(lam_eff, 0.12), xycoords="data", 
+                                      ha="center", fontsize="medium", rotation=90,
+                                      zorder=200, fontweight = "bold", clip_on=False) # zorder=20 puts text on top
             self.coverage_patches[f] = poly
 
         # --- Per-filter subplots below ---
-
         idx = 0
         
+        # Keep track of x-axis limits to sync them
+        share_x_ax = None 
+
         for r in range(self.nrows_filters):
             for c in range(self.ncols):
                 if idx >= n_filt:
                     break
 
                 f = filters[idx]
-                ax = self.fig.add_subplot(self.gs[r + 1, c])
-                ax.set_xlabel("MJD")
-                ax.set_ylabel("Magnitude")
+                
+                # Share X axis with the first plot to keep alignment perfect
+                if share_x_ax is None:
+                    ax = self.fig.add_subplot(self.gs[r + 1, c])
+                    share_x_ax = ax
+                else:
+                    ax = self.fig.add_subplot(self.gs[r + 1, c], sharex=share_x_ax)
+
                 self.axes_step1.append(ax)
                 self.ax_to_filter[ax] = f
 
                 sub = self.lightcurve_df[self.lightcurve_df["filter"] == f]
 
-                if "err" in sub.columns:
-                    ax.errorbar(sub["mjd"], sub["mag"], yerr=sub["err"], fmt="o", ms=3)
-                else:
-                    ax.plot(sub["mjd"], sub["mag"], "o", ms=3)
+                # Use the SAME color as the top plot
+                col = filter_colors[f]
 
-                ax.set_title(f)
+                if "err" in sub.columns:
+                    ax.errorbar(sub["mjd"], sub["mag"], yerr=sub["err"], 
+                                fmt="o", ms=3, color=col, ecolor=col, alpha=0.9)
+                else:
+                    ax.plot(sub["mjd"], sub["mag"], "o", ms=3, color=col, alpha=0.9)
+
+                # --- 3. OVERLAP PREVENTION ---
+                # A. Put Title INSIDE the plot (using zorder ensures it sits on top of data)
+                ax.text(0.5, 0.9, f, transform=ax.transAxes, 
+                        ha='center', va='top', fontsize=9, fontweight='bold',
+                        bbox=dict(facecolor='white', alpha=0.7, edgecolor='none', pad=1),
+                        zorder=30)
+                
+                # B. Handle Axis Labels (Only on edges)
+                is_bottom_row = (r == self.nrows_filters - 1)
+                is_left_col = (c == 0)
+
+                if is_bottom_row:
+                    ax.set_xlabel("MJD", fontsize=9)
+                else:
+                    ax.tick_params(labelbottom=False) # Hide x ticks
+                    
+                if is_left_col:
+                    ax.set_ylabel("Mag", fontsize=9)
+                else:
+                    ax.tick_params(labelleft=False) # Hide y ticks
+
                 ax.invert_yaxis()
                 ax.grid(True, alpha=0.1)
 
                 idx += 1
                 
-        for ax in self.axes_step1:
-            ax.set_xlim(self.mjd_min - 2, self.mjd_max + 2)
+        # Set limits for all (thanks to sharex, this applies to all)
+        if self.axes_step1:
+            self.axes_step1[0].set_xlim(self.mjd_min - 2, self.mjd_max + 2)
 
-        # Hide any unused grid cells
+        # Hide any unused grid cells in the rectangle
         total_axes = (self.nrows_filters) * self.ncols
         for extra in range(idx, total_axes):
             r = extra // self.ncols
@@ -735,41 +840,44 @@ class PseudoBoloWizard:
         # ------------------------------------------------------------------
         # Buttons
         # ------------------------------------------------------------------
-
-        # 1) Preset buttons (UBVRI/BVRI/JHK/All) – centered row
         btn_w  = 0.13
         btn_h  = 0.05
-        pad_x  = 0.02          # horizontal spacing between preset buttons
-        y_presets = 0.1       # vertical position of the preset row (above Next/Back)
+        pad_x  = 0.02          
+        y_presets = 0.1       
 
-        total_w = 4 * btn_w + 3 * pad_x
-        x0 = 0.5 - total_w / 2  # left edge so that the row is centered around x=0.5
+        total_w = 5 * btn_w + 3 * pad_x
+        x0 = 0.5 - total_w / 2  
 
         ax_ubvri = self.fig.add_axes([x0 + 0*(btn_w+pad_x), y_presets, btn_w, btn_h])
         ax_bvri  = self.fig.add_axes([x0 + 1*(btn_w+pad_x), y_presets, btn_w, btn_h])
         ax_jhk   = self.fig.add_axes([x0 + 2*(btn_w+pad_x), y_presets, btn_w, btn_h])
         ax_all   = self.fig.add_axes([x0 + 3*(btn_w+pad_x), y_presets, btn_w, btn_h])
+        ax_none  = self.fig.add_axes([x0 + 4*(btn_w+pad_x), y_presets, btn_w, btn_h])
 
         self.btn_ubvri = Button(ax_ubvri, "UBVRI")
         self.btn_bvri  = Button(ax_bvri,  "BVRI")
         self.btn_jhk   = Button(ax_jhk,   "JHK")
         self.btn_all   = Button(ax_all,   "All")
+        self.btn_none = Button(ax_none, "None")
 
         self.btn_ubvri.on_clicked(self._make_preset_callback("UBVRI"))
         self.btn_bvri.on_clicked(self._make_preset_callback("BVRI"))
         self.btn_jhk.on_clicked(self._make_preset_callback("JHK"))
         self.btn_all.on_clicked(self._make_preset_callback("All"))
+        self.btn_none.on_clicked(self._make_preset_callback("None"))
         
         self._step_widgets = [
             self.btn_ubvri,
             self.btn_bvri,
             self.btn_jhk,
             self.btn_all,
+            self.btn_none
         ]
         
         self.cid_click_step1 = self.fig.canvas.mpl_connect(
             "button_press_event", self._on_click_step1)
         self.fig.canvas.draw_idle()
+
 
 
 
@@ -816,7 +924,7 @@ class PseudoBoloWizard:
         )
 
         # Filters to show = those selected in step 1
-        filters = self.selected_filters or self.filters
+        filters = self.selected_filters
         n_filt = len(filters)
         if n_filt == 0:
             raise ValueError("No filters to show in step 2.")
@@ -885,6 +993,9 @@ class PseudoBoloWizard:
                         length_scale=10.0,
                     )
                     self.gp_interp[f] = {"mjd": self.time_grid, "mag": mu, "err": sigma}
+                    
+                    if self.save_steps:
+                        self._save_filter_interp(f)
 
                     # Plot GP mean and 1σ band
                     ax.scatter(self.time_grid, mu, s=15, label="GP mean", c = '#BD2D87')  # no "-"
@@ -905,7 +1016,7 @@ class PseudoBoloWizard:
 
                 idx += 1
         for ax in self.axes_step2:
-            ax.set_xlim(self.mjd_min - 2, self.mjd_max + 2)
+            ax.set_xlim(min(self.time_grid) - 2, max(self.time_grid) + 2)
 
         # Hide any unused cells
         total_cells = nrows * self.ncols
@@ -917,6 +1028,13 @@ class PseudoBoloWizard:
 
         self.fig.subplots_adjust(bottom=0.18, top=0.88, hspace=0.4)
         self.fig.canvas.draw_idle()
+        # 1. Define a filename (maybe include the filter name or step number)
+        filt_list = ", ".join(filters)
+        filename = self.RESULTS_DIR /f"{self.hdr.name}_filter_interpolations_{filt_list}.png"
+        # 2. Save the figure
+        self.fig.savefig(filename, dpi=300, bbox_inches='tight')
+
+        print(f"Saved figure to {filename}")
         
         
     def _compute_fluxes_from_gp(self):
@@ -1016,6 +1134,174 @@ class PseudoBoloWizard:
         # store the big arrays on the wizard
         self.interpflux = interpflux
         self.interpfluxerr = interpfluxerr
+        
+    def _integrate_fluxes_trapezoidal(self):
+        self._compute_fluxes_from_gp()
+        
+        filters = self.selected_filters
+        if not filters:
+            raise RuntimeError("No filters selected.")
+
+        # 1. Sort filters by wavelength
+        filters_sorted = sorted(filters, key=lambda f: self.pbinfo.loc[f, "lambda_eff"])
+        self.selected_filters_sorted = filters_sorted
+        
+        # 2. Get Effective Wavelengths and Widths
+        lam_effs = np.array([float(self.pbinfo.loc[f, "lambda_eff"]) for f in filters_sorted])
+        ews      = np.array([float(self.pbinfo.loc[f, "ew"]) for f in filters_sorted])
+        
+        # 3. Get Fluxes (n_filters, n_time_steps)
+        idx_map = [filters.index(f) for f in filters_sorted]
+        F = self.interpflux[idx_map, :]    # Flux
+        Ferr = self.interpfluxerr[idx_map, :] # Error
+        
+        # 4. Define the Integration Grid
+        # We start at the Blue Edge of the first filter
+        # We go through the Centers of all filters
+        # We end at the Red Edge of the last filter
+        
+        start_lam = lam_effs[0] - ews[0]/2.0
+        end_lam   = lam_effs[-1] + ews[-1]/2.0
+        
+        # 5. Perform Integration per timestep
+        nt = F.shape[1]
+        flux_int = np.zeros(nt)
+        flux_int_err = np.zeros(nt)
+
+        for t in range(nt):
+            # Construct the SED curve for this specific timestep
+            fluxes_at_t = F[:, t]
+            errs_at_t   = Ferr[:, t]
+            
+            # --- The Integration Arrays ---
+            # X: [BlueEdge_1,  Center_1,    Center_2,   ..., Center_N,    RedEdge_N]
+            # Y: [Flux_1,      Flux_1,      Flux_2,     ..., Flux_N,      Flux_N   ]
+            
+            # We assume flux is constant from the Blue Edge to the first Center
+            # We linearly interpolate between Centers
+            # We assume flux is constant from the last Center to the Red Edge
+            
+            x_grid = np.concatenate(([start_lam], lam_effs, [end_lam]))
+            y_grid = np.concatenate(([fluxes_at_t[0]], fluxes_at_t, [fluxes_at_t[-1]]))
+            
+            # Trapezoidal Integration (Area under the curve)
+            flux_int[t] = np.trapz(y_grid, x_grid)
+            
+            # Error Propagation (Quadrature for Trapezoidal Rule is complex, 
+            # approximate by treating segments as independent blocks or linear combos)
+            # Simple approx: Integrate variance similarly
+            # (Strictly speaking, you should sum (0.5 * dx * err)^2, but this is a close proxy)
+            y_err_grid = np.concatenate(([errs_at_t[0]], errs_at_t, [errs_at_t[-1]]))
+            # Square the errors, integrate squared errors, take sqrt? 
+            # A simplified approach usually used in mklcbol versions:
+            # Sum of (width * error) in quadrature.
+            
+            # Let's stick to a robust approximation for errors:
+            # We calculate the widths associated with each filter
+            # For filter i: width = (lam[i+1] - lam[i-1]) / 2
+            
+            # Define "effective integration width" for each filter in the chain
+            dlam = np.zeros_like(lam_effs)
+            dlam[0] = (lam_effs[1] - lam_effs[0])/2.0 + ews[0]/2.0 # First filter
+            dlam[-1] = (lam_effs[-1] - lam_effs[-2])/2.0 + ews[-1]/2.0 # Last filter
+            dlam[1:-1] = (lam_effs[2:] - lam_effs[:-2]) / 2.0 # Middle filters
+            
+            flux_int_err[t] = np.sqrt(np.sum((dlam * errs_at_t)**2))
+
+        self.flux_int = flux_int
+        self.flux_int_err = flux_int_err
+
+    def _integrate_fluxes_histogram(self):
+        self._compute_fluxes_from_gp()
+        filters = self.selected_filters
+        
+        # 1. Sort filters by wavelength
+        filters_sorted = sorted(filters, key=lambda f: self.pbinfo.loc[f, "lambda_eff"])
+        
+        # 2. Get Fluxes: Shape should be (n_filters, n_timesteps)
+        idx_map = [filters.index(f) for f in filters_sorted]
+        F = self.interpflux[idx_map, :]    
+        Ferr = self.interpfluxerr[idx_map, :] 
+        
+        n_filters, nt = F.shape # e.g. (5 filters, 100 timesteps)
+
+        # 3. Define all Edges
+        lam_effs = np.array([float(self.pbinfo.loc[f, "lambda_eff"]) for f in filters_sorted])
+        ews      = np.array([float(self.pbinfo.loc[f, "ew"]) for f in filters_sorted])
+        blue_edges = lam_effs - ews/2.0
+        red_edges  = lam_effs + ews/2.0
+        
+        # 4. Create Unique Boundaries Grid
+        boundaries = np.unique(np.concatenate([blue_edges, red_edges]))
+        boundaries.sort()
+        
+        # 5. Initialize Output Array (Vector of size nt)
+        # CRITICAL: Do not initialize as scalar 0.0
+        flux_int = np.zeros(nt, dtype=float)
+        flux_int_err_sq = np.zeros(nt, dtype=float) # Sum of variances
+
+        # 6. Loop over WAVELENGTH bins
+        for i in range(len(boundaries) - 1):
+            w_start = boundaries[i]
+            w_end   = boundaries[i+1]
+            w_center = (w_start + w_end) / 2.0
+            width = w_end - w_start
+            
+            active_mask = (blue_edges <= w_center) & (red_edges >= w_center)
+            
+            if np.any(active_mask):
+                # --- Normal Overlap Logic (Same as before) ---
+                avg_flux_in_bin = np.mean(F[active_mask, :], axis=0)
+                n_active = np.sum(active_mask)
+                sum_sq_errs = np.sum(Ferr[active_mask, :]**2, axis=0)
+                var_mean_in_bin = sum_sq_errs / (n_active**2)
+                
+                flux_int += width * avg_flux_in_bin
+                flux_int_err_sq += (width**2) * var_mean_in_bin
+
+            else:
+                # --- GAP LOGIC (New) ---
+                # Find neighbors
+                idx_left = np.where(np.isclose(red_edges, w_start))[0]
+                idx_right = np.where(np.isclose(blue_edges, w_end))[0]
+                
+                flux_neighbors = []
+                var_neighbors = []
+                
+                if idx_left.size > 0:
+                    # Mean of filters ending on the left
+                    flux_neighbors.append(np.mean(F[idx_left, :], axis=0))
+                    # Var of mean
+                    v_left = np.sum(Ferr[idx_left, :]**2, axis=0) / (idx_left.size**2)
+                    var_neighbors.append(v_left)
+
+                if idx_right.size > 0:
+                    # Mean of filters starting on the right
+                    flux_neighbors.append(np.mean(F[idx_right, :], axis=0))
+                    # Var of mean
+                    v_right = np.sum(Ferr[idx_right, :]**2, axis=0) / (idx_right.size**2)
+                    var_neighbors.append(v_right)
+                
+                if flux_neighbors:
+                    # Average the Left Group and Right Group
+                    # (This mimics the IDL logic: 0.5 * (F_left + F_right))
+                    avg_gap_flux = np.mean(flux_neighbors, axis=0)
+                    
+                    # Error prop: Sqrt(Sum(Vars)) / N
+                    # We have N groups (usually 2: left and right)
+                    n_groups = len(flux_neighbors)
+                    sum_vars = np.sum(var_neighbors, axis=0)
+                    var_gap = sum_vars / (n_groups**2)
+                    
+                    flux_int += width * avg_gap_flux
+                    flux_int_err_sq += (width**2) * var_gap
+
+        # Finalize
+        self.flux_int = flux_int
+        self.flux_int_err = np.sqrt(flux_int_err_sq)
+        self.selected_filters_sorted = filters_sorted
+
+
                 
     def _integrate_fluxes(self):
         """
@@ -1025,95 +1311,52 @@ class PseudoBoloWizard:
           - self.flux      : (nt,) bolometric luminosity
           - self.flux_int_err  : (nt,) bolometric luminosity error
         """
-        self._compute_fluxes_from_gp()
-        if not hasattr(self, "interpflux"):
-            raise RuntimeError("GP fluxes not computed yet.")
-
-        filters = self.selected_filters
-        if not filters:
-            raise RuntimeError("No filters selected when computing integrated flux.")
-
-        # sort by lambda_eff as in IDL:
-        filters_sorted = sorted(filters, key=lambda f: self.pbinfo.loc[f, "lambda_eff"])
-
-        idx_map = [filters.index(f) for f in filters_sorted]
-        F = self.interpflux[idx_map, :]
-        Ferr = self.interpfluxerr[idx_map, :]
+        if self.integration_method == "trapezoidal":
+            self._integrate_fluxes_trapezoidal()
+        else:
+            self._integrate_fluxes_histogram()
         
-        nselect, nt = F.shape
+        if self.save_steps:
+            infile = self.infile
+            hdr = self.hdr
+            flux_int = self.flux_int
+            flux_int_err = self.flux_int_err
+            filters = self.selected_filters_sorted or self.filters
+            filt_list = ", ".join(filters)
+            shortnames = "".join(filter_shortname(f) for f in filters)
+            flux_peak = np.max(flux_int)
+            flux_peak_err = flux_int_err[np.argmax(flux_int)]
+            t_peak = self.time_grid[np.argmax(flux_int)]
+            t = self.time_grid
+            #Save integrated flux file for comparison:
+            # Default output name if none chosen elsewhere
+            outname = f"{hdr.name}_lcbol_{shortnames}_flux_int_py.dat"
+            output_dir = infile.parent.parent / "tests_results"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            fout = output_dir / outname
+            fout = pathlib.Path(fout)
 
-        flux_int = np.zeros(nt, dtype=float)
-        flux_int_err = np.zeros(nt, dtype=float)
+            from datetime import datetime, UTC
 
-        idxlap = 0          # 1 if current filter overlaps with previous
-        wred_prev = None    # store previous filter's red edge
+            with fout.open("w") as f:
+                f.write(f"#generated on {datetime.now(UTC).isoformat()} using single_sne bolometric LC wizard\n")
+                f.write(f"#FLUX_INT_PEAK:   {flux_peak:.8e} +/- {flux_peak_err:.8e}\n")
+                f.write(f"#MJD_PEAK: {t_peak:.5f}\n")
+                f.write(f"#INFILE    {infile.name}\n")
+                f.write(f"#NAME      {hdr.name}\n")
+                f.write(f"#AV_HOST   {hdr.avhost:6.3f} +/- {hdr.avhosterr:6.3f}\n")
+                f.write(f"#RV_HOST   {hdr.rvhost:6.3f} +/- {hdr.rvhosterr:6.3f}\n")
+                f.write(f"#AV_MW     {hdr.avmw:6.3f} +/- {hdr.avmwerr:6.3f}\n")
+                f.write(f"#RV_MW     {hdr.rvmw:6.3f} +/- {hdr.rvmwerr:6.3f}\n")
+                f.write(f"#DIST_MOD  {hdr.dmod:6.3f} +/- {hdr.dmoderr:6.3f}\n")
+                f.write(f"#NFILT     {len(filters):2d} ({filt_list})\n")
+                f.write("#\n")
+                f.write("#time[d]    flux_int     flux_int_err\n")
+                for tt, LL, LLerr in zip(t, flux_int, flux_int_err):
+                    f.write(f"{tt:10.3f}  {LL:15.8E}  {LLerr:15.8E}\n")
 
-        for i, f in enumerate(filters_sorted):
-            meta = self.pbinfo.loc[f]
-            lam = float(meta["lambda_eff"])
-            ew  = float(meta["ew"])
-
-            # Red edge of this filter
-            wred = lam + ew / 2.0
-
-            # Blue edge depends on overlap with previous filter
-            if i > 0 and idxlap == 1:
-                # continuation from previous overlap
-                wblue = wred_prev
-            else:
-                # normal blue edge
-                wblue = lam - ew / 2.0
-
-            if i < nselect - 1:
-                # all but last filter: compare with next filter
-                f_next = filters_sorted[i + 1]
-                meta_next = self.pbinfo.loc[f_next]
-                lam_next = float(meta_next["lambda_eff"])
-                ew_next  = float(meta_next["ew"])
-
-                wbluenext = lam_next - ew_next / 2.0  # blue edge of next filter
-
-                if wred <= wbluenext:
-                    # --- GAP between this filter and the next ---
-                    # FILTER segment: [wblue, wred] with this filter's flux
-                    width_filt = wred - wblue
-                    # GAP segment: [wred, wbluenext] with mean flux
-                    width_gap = wbluenext - wred
-
-                    flux_int += width_filt * F[i, :]
-                    flux_int += width_gap * 0.5 * (F[i, :] + F[i + 1, :])
-
-                    # Errors:
-                    flux_int_err += width_filt * Ferr[i, :]
-                    flux_int_err += width_gap * 0.5 * np.sqrt(Ferr[i, :]**2 + Ferr[i + 1, :]**2)
-
-                    idxlap = 0
-                else:
-                    # --- OVERLAP with next filter ---
-                    # Non-overlap part: [wblue, wbluenext] at this filter's flux
-                    width_nonoverlap = wbluenext - wblue
-                    # Overlap part: [wbluenext, wred] at mean flux
-                    width_overlap = wred - wbluenext
-
-                    flux_int += width_nonoverlap * F[i, :]
-                    flux_int += width_overlap * 0.5 * (F[i, :] + F[i + 1, :])
-
-                    flux_int_err += width_nonoverlap * Ferr[i, :]
-                    flux_int_err += width_overlap * 0.5 * np.sqrt(Ferr[i, :]**2 + Ferr[i + 1, :]**2)
-
-                    idxlap = 1
-            else:
-                # --- last filter: no overlap with next possible ---
-                width_last = wred - wblue
-                flux_int += width_last * F[i, :]
-                flux_int_err += width_last * Ferr[i, :]
-
-            wred_prev = wred
-
-        # Store results
-        self.selected_filters_sorted = filters_sorted
-        self.flux_int = flux_int
-        self.flux_int_err = flux_int_err
+            print(f"Created file {fout}")
+            
         self._compute_luminosity_and_ni()
         
     def _compute_luminosity_and_ni(self):
@@ -1169,7 +1412,12 @@ class PseudoBoloWizard:
         """Build the animation view (step 3)."""
         # Make sure fluxes & time_grid exist
         
+        # Ensure integration method is set (Default to trapezoidal if missing)
+        if not hasattr(self, "integration_method"):
+            self.integration_method = "trapezoidal"
+
         self._integrate_fluxes()
+        
         if not hasattr(self, "interpflux") or not hasattr(self, "flux_int"):
             raise RuntimeError("Need interpflux and flux_int computed before step 3.")
 
@@ -1180,8 +1428,10 @@ class PseudoBoloWizard:
         # Clear figure and reserve space for bottom buttons
         self._clear_step_widgets()
         self._clear_axes()
+        
+        method_title = "Trapezoidal" if self.integration_method == "trapezoidal" else "Merged Histogram"
         self.fig.suptitle(
-            "Step 3: Integrated flux animation\n"
+            f"Step 3: Integrated flux animation ({method_title})\n"
             "Press 'Play'/'Pause' to control the animation.",
             y=0.99,
         )
@@ -1218,7 +1468,7 @@ class PseudoBoloWizard:
         ax_flux.set_ylim(0.0, ymax)
         ax_flux.set_xlabel("Wavelength [\\AA]")
         ax_flux.set_ylabel("Flux")
-        ax_flux.set_title("Flux in each filter \\& Integration Profile")
+        ax_flux.set_title("Flux in each filter \& Integration Profile")
 
         # --- Create bar patches for each filter (one per filter) ---
         from matplotlib.patches import Rectangle
@@ -1235,23 +1485,22 @@ class PseudoBoloWizard:
                 linewidth=0.0,
                 edgecolor="none",
                 facecolor="#083D77",
-                alpha=0.7,
+                alpha=0.4, # Made slightly more transparent to see the pink line better
             )
             ax_flux.add_patch(rect)
             self.step3_bar_patches.append(rect)
 
         # --- Pink integration profile line ---
-        (self.step3_profile_line,) = ax_flux.plot([], [], "-", lw=2.0, color="#DC0073", alpha = 0.7)
+        (self.step3_profile_line,) = ax_flux.plot([], [], "-", lw=2.5, color="#DC0073", alpha = 0.9)
 
         # --- Integrated flux light curve panel ---
         t = self.time_grid
-        fl_int = self.flux_int  # or whatever you call integrated L
-        
+        fl_int = self.flux_int 
 
         # Full LC, drawn once and never changed
         _ = ax_lc.scatter(t, fl_int, s = 15, color = "#083D77")
         ax_lc.set_xlabel("MJD")
-        ax_lc.set_ylabel("Integrated Flux")  # or "Luminosity"
+        ax_lc.set_ylabel("Integrated Flux")
 
         # Moving point that will be updated per frame
         self.step3_lc_point = ax_lc.plot(
@@ -1264,8 +1513,6 @@ class PseudoBoloWizard:
         )
 
         # --- Play / Pause buttons at bottom center ---
-        # You likely already have Next / Back axes; reuse style/positions if you want.
-      
         ax_play = self.fig.add_axes([self.x_back, 4*self.y_nav, self.nav_w, self.nav_h])
         ax_pause = self.fig.add_axes([self.x_next, 4*self.y_nav, self.nav_w, self.nav_h])
 
@@ -1275,6 +1522,9 @@ class PseudoBoloWizard:
 
         self.btn_play.on_clicked(self._on_play_step3)
         self.btn_pause.on_clicked(self._on_pause_step3)
+        self._step_widgets = [
+            self.btn_play, self.btn_pause
+        ]
 
         # --- Animation state and timer ---
         self.step3_frame_index = 0
@@ -1290,17 +1540,15 @@ class PseudoBoloWizard:
         
 
     def _update_step3_frame(self, i_frame: int):
-        """Update all artists for given frame index."""
+        """Update all artists for given frame index using selected Integration Method."""
         filters = self.selected_filters_sorted
         if not filters:
-            raise RuntimeError("No filters selected for animation frame update.")  
-        pb = self.pbinfo.loc[filters]
+            return 
+            
         lam_eff = self.step3_lam_eff
-        
         ew = self.step3_ew
 
         # Map filters (sorted by lambda) to rows in interpflux
-        # interpflux shape = (n_select, nt), with row order = selected_filters
         selected = self.selected_filters
         idx_map = [selected.index(f) for f in filters]
 
@@ -1311,57 +1559,66 @@ class PseudoBoloWizard:
         for rect, f_val in zip(self.step3_bar_patches, flux_now):
             rect.set_height(float(f_val))
 
-        # --- Build pink integration profile as in IDL ---
+        # --- Build pink integration profile based on Method ---
         x_prof = []
         y_prof = []
+        
+        # Determine edges for current frame
+        blue_edges = lam_eff - ew / 2.0
+        red_edges = lam_eff + ew / 2.0
 
-        idxlap = 0  # 1 if current filter overlaps with previous
-        y1prev = 0.0
-        wred_prev = None
+        if self.integration_method == "trapezoidal":
+            # --- METHOD A: TRAPEZOIDAL ---
+            # Connect centers, extend flat to outer edges
+            
+            # 1. Start at Blue Edge of Filter 0
+            # 2. Go through all centers
+            # 3. End at Red Edge of Filter -1
+            
+            x_prof = np.concatenate(([blue_edges[0]], lam_eff, [red_edges[-1]]))
+            y_prof = np.concatenate(([flux_now[0]], flux_now, [flux_now[-1]]))
 
-        nsel = len(filters)
-        for ii in range(nsel):
-            lam_i = lam_eff[ii]
-            ew_i = ew[ii]
-            wred = lam_i + ew_i / 2.0
-
-            if ii > 0 and idxlap == 1 and wred_prev is not None:
-                wblue = wred_prev
-            else:
-                wblue = lam_i - ew_i / 2.0
-
-            if ii < nsel - 1:
-                lam_next = lam_eff[ii + 1]
-                ew_next = ew[ii + 1]
-                wbluenext = lam_next - ew_next / 2.0
-
-                if wred <= wbluenext:
-                    # Isolated filter + gap
-                    y0 = flux_now[ii]  # filter plateau
-                    y1 = 0.5 * (flux_now[ii] + flux_now[ii + 1])  # gap midpoint
-
-                    x_prof.extend([wblue, wblue, wred, wred, wbluenext])
-                    y_prof.extend([y1prev, y0, y0, y1, y1])
-
-                    idxlap = 0
-                    y1prev = y1
+        else:
+            # --- METHOD B: HISTOGRAM (Merged Bins) ---
+            
+            # 1. Create unique sorted boundaries from all edges
+            boundaries = np.unique(np.concatenate([blue_edges, red_edges]))
+            boundaries.sort()
+            
+            # 2. Iterate through bins
+            for i in range(len(boundaries) - 1):
+                w_start = boundaries[i]
+                w_end = boundaries[i+1]
+                w_center = (w_start + w_end) / 2.0
+                
+                # Check which filters are active in this bin
+                active_mask = (blue_edges <= w_center) & (red_edges >= w_center)
+                
+                if np.any(active_mask):
+                    # Normal Overlap: Mean of active filters
+                    val = np.mean(flux_now[active_mask])
                 else:
-                    # Overlap with next filter
-                    y0 = flux_now[ii]
-                    y1 = 0.5 * (flux_now[ii] + flux_now[ii + 1])
-
-                    x_prof.extend([wblue, wblue, wbluenext, wbluenext, wred])
-                    y_prof.extend([y1prev, y0, y0, y1, y1])
-
-                    idxlap = 1
-                    y1prev = y1
-            else:
-                # Last filter
-                y0 = flux_now[ii]
-                x_prof.extend([wblue, wblue, wred, wred])
-                y_prof.extend([y1prev, y0, y0, 0.0])
-
-            wred_prev = wred
+                    # --- GAP LOGIC: Bridge Neighbors ---
+                    # Find filters that END exactly at w_start
+                    left_neighbors = np.where(np.isclose(red_edges, w_start))[0]
+                    # Find filters that START exactly at w_end
+                    right_neighbors = np.where(np.isclose(blue_edges, w_end))[0]
+                    
+                    neighbor_vals = []
+                    
+                    if left_neighbors.size > 0:
+                        neighbor_vals.append(np.mean(flux_now[left_neighbors]))
+                    if right_neighbors.size > 0:
+                        neighbor_vals.append(np.mean(flux_now[right_neighbors]))
+                        
+                    if neighbor_vals:
+                        # Mean of the Left and Right neighbors
+                        val = np.mean(neighbor_vals)
+                    else:
+                        val = 0.0 
+                
+                x_prof.extend([w_start, w_end])
+                y_prof.extend([val, val])
 
         self.step3_profile_line.set_data(x_prof, y_prof)
 
@@ -1375,16 +1632,15 @@ class PseudoBoloWizard:
         # Move the single point
         self.step3_lc_point.set_data([t_now], [L_now])
 
-        # Update label (optional)
+        # Update label
         self.step3_time_text.set_text(f"MJD = {t_now:.2f}")
-            
+
     def _advance_frame_step3(self):
         """Timer callback: advance one frame if running."""
         if not self.step3_anim_running:
             return
 
         nt = len(self.time_grid)
-        # Wrap around at the end so Play restarts automatically
         self.step3_frame_index = (self.step3_frame_index + 1) % nt
 
         self._update_step3_frame(self.step3_frame_index)
@@ -1405,8 +1661,7 @@ class PseudoBoloWizard:
             return
         self.step3_anim_running = False
         self.step3_timer.stop()
-                
-                
+
     def _build_step4(self):
         """
         Step 4: show the final bolometric light curve (luminosity vs time),
@@ -1518,7 +1773,7 @@ class PseudoBoloWizard:
 
         # Default output name if none chosen elsewhere
         outname = f"{hdr.name}_lcbol_{shortnames}_py.dat"
-        fout = infile.parent.parent / "test_results" / outname
+        fout = infile.parent.parent / "tests_results" / outname
         fout = pathlib.Path(fout)
 
         from datetime import datetime, UTC
@@ -1553,7 +1808,7 @@ class PseudoBoloWizard:
         shortnames = "".join(filter_shortname(f) for f in filters)
 
         outname = f"{hdr.name}_lcbol_{shortnames}_Lbol_py.png"
-        ffig = infile.parent.parent / "test_results" / outname
+        ffig = infile.parent.parent / "tests_results" / outname
 
         self.fig.savefig(ffig, dpi=150, bbox_inches="tight")
         print(f"Saved figure {ffig}")

@@ -6,7 +6,7 @@ import pandas as pd
 import pathlib
 from typing import Dict
 from typing import List, Optional, Sequence, Tuple
-from pseudobolo.dataclasses import LightCurveHeader, FilterLightCurve, PassbandInfo
+from pseudobolo.dataclasses_lc import LightCurveHeader, FilterLightCurve, PassbandInfo
 import requests
 from bs4 import BeautifulSoup
 from astropy.constants import c 
@@ -172,10 +172,11 @@ def rd_lcbol_data(infile: str | pathlib.Path, debug = False) -> Tuple[LightCurve
         i += 1
         parts = header_line.split()
         # Expect something like: "#FILTER B_Bessell NMEAS 23"
-        if len(parts) < 4 or parts[0] != "#FILTER":
+        if len(parts) < 2 or parts[0] != "#FILTER":
             raise ValueError(f"Malformed filter header line: {header_line!r}")
 
         filt_name = parts[1]
+        
         try:
             nmeas = int(parts[3])
         except ValueError as e:

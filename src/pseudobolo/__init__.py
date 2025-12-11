@@ -7,6 +7,6 @@ Main user-facing objects:
 """
 
 from .aux import create_lc_df
-from .make_bol_lc import BolLCWizard
+from .make_bol_lc import PseudoBoloWizard
 
 __all__ = ["create_lc_df", "PseudoBoloWizard"]

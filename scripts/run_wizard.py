@@ -14,21 +14,13 @@ RESULTS_DIR = ROOT / "tests" / "tests_results"
 
 def main():
     base = pathlib.Path(__file__).resolve().parents[1]  # repo root (single_sne level)
-    infile = base / "tests" / "tests_data" / "sn2002bo_lcbolinput.dat"
+    infile_2025cy = base / "tests" / "tests_data" / "SN2025cy_lcbolinput_v2.dat"
+    infile_2025ifq = base / "tests" / "tests_data" / "SN2025ifq_lcbolinput.dat"
+
     pbinfo_file = base / "tests" / "tests_data" / "pbinfo.dat"
 
-    wizard = PseudoBoloWizard(infile, pbinfo_file)
+    wizard = PseudoBoloWizard(infile_2025cy, pbinfo_file)
     selected_filters = wizard.run()
-    
-    
-    #compared saved results to IDL outputs:
-    data_idl = DATA_DIR / "sn2002bo_lcbol_UBVRI.dat"
-    t_idl, Lbol_idl, Lbolerr_idl = np.loadtxt(
-    data_idl,
-    comments="#",
-    unpack=True,      # <- THIS is the key
-    usecols=(0, 1, 2) # optional, but makes it explicit
-    )
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-Build lcbol input files for mklcbol from BlackGEM + Swift UVOT photometry.
+Build lcbol input files for mklcbol from BlackGEM + Swift UVOT + LCO photometry.
 
 Output format matches the IDL / legacy mklcbolinput.pro style, e.g.:
 
@@ -17,9 +17,10 @@ Output format matches the IDL / legacy mklcbolinput.pro style, e.g.:
 #FILTER B_Bessell - 50 MEASUREMENTS (MJD MAG MAGERR)
 ...
 
-For SN2025cy we’ll typically combine:
+For SN2025cy we combine:
 - BlackGEM: u_BG, q_BG, i_BG
 - Swift UVOT AB: uu_Swift, bb_Swift, vv_Swift, uvw1_Swift, uvw2_Swift, uvm2_Swift
+- LCO photometry
 """
 
 from __future__ import annotations
@@ -45,6 +46,25 @@ BG_FILTER_MAP = {
     "r": "r_BG",
     "i": "i_BG",
     "z": "z_BG",
+}
+
+#UVOT Filter mapping
+UVOT_FILTER_MAP = {
+    "u": "uu_Swift",
+    "b": "bb_Swift",
+    "v": "vv_Swift",
+    "uvw1": "uvw1_Swift",
+    "uvw2": "uvw2_Swift",
+    "uvm2": "uvm2_Swift",
+}
+
+#Los Cumbres Observatory Filter Mapping
+LCO_FILTER_MAP = {
+    "B": "B_Bessell",
+    "V": "V_Bessell",
+    "gp": "g_SDSSv5",
+    "rp": "r_SDSSv5",
+    "ip": "i_SDSSv5",
 }
 
 @dataclass
@@ -109,16 +129,6 @@ def read_blackgem_csv(path: str | pathlib.Path) -> pd.DataFrame:
     return out
 
 
-#UVOT Filter mapping
-UVOT_FILTER_MAP = {
-    "u": "uu_Swift",
-    "b": "bb_Swift",
-    "v": "vv_Swift",
-    "uvw1": "uvw1_Swift",
-    "uvw2": "uvw2_Swift",
-    "uvm2": "uvm2_Swift",
-}
-
 def read_uvot_ab_txt(path: str | pathlib.Path) -> pd.DataFrame:
     """
     Read Swift UVOT photometry (already in AB mags) from a text file with columns:
@@ -161,6 +171,49 @@ def read_uvot_ab_txt(path: str | pathlib.Path) -> pd.DataFrame:
 
     return out
 
+def read_lco_txt(path: str | pathlib.Path) -> pd.DataFrame:
+    """
+    Read LCO photometry (B, V in Vega, gri in AB mags) from a text file with columns:
+
+        mjd mag err filter subtracted?
+
+    Returns a DataFrame with columns:
+        ['mjd', 'mag', 'magerr', 'pb_name']
+    """
+    path = pathlib.Path(path)
+
+    df = pd.read_csv(
+        path,
+        sep = r"\s+",
+        comment="#",
+        header=0,
+    )
+    print(df.columns)
+
+    expected = {"mjd", "mag", "err", "filter", "subtracted?"}
+    missing = expected - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing columns in LCO file {path}: {missing}")
+
+    # Normalize filter names and map to pbinfo names
+    filt = df["filter"].astype(str).str.strip()#.str.lower()
+    pb_name = filt.map(LCO_FILTER_MAP)
+
+    mask = pb_name.notna()
+    if not mask.any():
+        raise ValueError(f"No LCO filters could be mapped using LCO_FILTER_MAP in {path}")
+
+    out = pd.DataFrame(
+        {
+            "mjd": df.loc[mask, "mjd"].astype(float),
+            "mag": df.loc[mask, "mag"].astype(float),
+            "magerr": df.loc[mask, "err"].astype(float),
+            "pb_name": pb_name[mask],
+        }
+    )
+
+    return out
+
 
 def get_ned_ebv(name: str) -> Optional[float]:
     """
@@ -193,12 +246,13 @@ def build_mklcbol_input(
     sn_name: str,
     bg_csv: str | pathlib.Path | None = None,
     uvot_txt: str | pathlib.Path | None = None,
+    lco_txt: str | pathlib.Path | None = None,
     extinction: Optional[ExtinctionInfo] = None,
     ned_name: Optional[str] = None,
 ) -> pathlib.Path:
     """
     Build an mklcbol-compatible input file for `mklcbol` from
-    BlackGEM and Swift UVOT AB photometry.
+    BlackGEM and Swift UVOT AB and LCO photometry.
 
     Parameters
     ----------
@@ -210,6 +264,8 @@ def build_mklcbol_input(
         BlackGEM photometry CSV file (AB mags).
     uvot_txt : path-like, optional
         Swift UVOT AB photometry text file.
+    lco_txt : path-like, optional
+        LCO photometry text file.
     extinction : ExtinctionInfo, optional
         Extinction & distance info for header. If None, a default
         ExtinctionInfo() is used (you should override in practice).
@@ -245,9 +301,13 @@ def build_mklcbol_input(
     if uvot_txt is not None:
         uv = read_uvot_ab_txt(uvot_txt)
         frames.append(uv[["mjd", "mag", "magerr", "pb_name"]])
+        
+    if lco_txt is not None:
+        lco = read_lco_txt(lco_txt)
+        frames.append(lco[["mjd", "mag", "magerr", "pb_name"]])
 
     if not frames:
-        raise RuntimeError("No photometry provided (both bg_csv and uvot_txt are None or empty).")
+        raise RuntimeError("No photometry provided")
 
     phot = pd.concat(frames, ignore_index=True)
 
@@ -323,6 +383,7 @@ if __name__ == "__main__":
     parser.add_argument("--name", required=True, help="SN name, e.g. SN2025cy")
     parser.add_argument("--bg-csv", help="BlackGEM photometry CSV (AB mags)")
     parser.add_argument("--uvot-txt", help="Swift UVOT AB photometry text file")
+    parser.add_argument("--lco-txt", help="LCO photometry text file")
     parser.add_argument("--av-host", type=float, default=0.0)
     parser.add_argument("--av-host-err", type=float, default=0.0)
     parser.add_argument("--rv-host", type=float, default=3.1)
@@ -355,6 +416,7 @@ if __name__ == "__main__":
         sn_name=args.name,
         bg_csv=args.bg_csv,
         uvot_txt=args.uvot_txt,
+        lco_txt= args.lco_txt,
         extinction=ext,
         ned_name=args.ned_name,
     )
