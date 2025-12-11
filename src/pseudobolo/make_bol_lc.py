@@ -1028,14 +1028,15 @@ class PseudoBoloWizard:
 
         self.fig.subplots_adjust(bottom=0.18, top=0.88, hspace=0.4)
         self.fig.canvas.draw_idle()
-        # 1. Define a filename (maybe include the filter name or step number)
-        filt_list = ", ".join(filters)
-        filename = self.RESULTS_DIR /f"{self.hdr.name}_filter_interpolations_{filt_list}.png"
-        # 2. Save the figure
-        self.fig.savefig(filename, dpi=300, bbox_inches='tight')
+        if self.save_steps:
+            # 1. Define a filename (maybe include the filter name or step number)
+            filt_list = ", ".join(filters)
+            filename = self.RESULTS_DIR /"filter_interp"/{self.hdr.name}_filter_interpolations_{filt_list}.png"
+            # 2. Save the figure
+            self.fig.savefig(filename, dpi=300, bbox_inches='tight')
 
-        print(f"Saved figure to {filename}")
-        
+            print(f"Saved figure to {filename}")
+            
         
     def _compute_fluxes_from_gp(self):
         """
