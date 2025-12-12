@@ -34,7 +34,7 @@ jobs:
           python -c "import sys; print('python:', sys.version)"
           python -c "import sphinx; print('sphinx:', sphinx.__version__)"
           # build
-          python -m sphinx.cmd.build -b html docs docs/_build/html
+          python -m sphinx.cmd.build -b html doc/source docs/_build/html
 
       - name: Upload HTML as artifact
         uses: actions/upload-artifact@v4
